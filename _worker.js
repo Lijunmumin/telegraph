@@ -92,6 +92,16 @@ export default {
         return handleBingImagesRequest();
       case '/delete-images':
         return await handleDeleteImagesRequest(request, config);
+      case '/create-folder':
+        return await handleCreateFolderRequest(request, config);
+      case '/delete-folder':
+        return await handleDeleteFolderRequest(request, config);
+      case '/move-files':
+        return await handleMoveFilesRequest(request, config);
+      case '/rename-file':
+        return await handleRenameFileRequest(request, config);
+      case '/rename-folder':
+        return await handleRenameFolderRequest(request, config);
       default:
         return await handleImageRequest(request, config);
     }
@@ -126,9 +136,9 @@ async function handleRootRequest(request, config) {
   <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Telegraph图床-基于Workers的图床服务">
-  <meta name="keywords" content="Telegraph图床,Workers图床, Cloudflare, Workers,telegra.ph, 图床">
-  <title>Telegraph图床-基于Workers的图床服务</title>
+  <meta name="description" content="Telegraph文件床-基于Workers的文件床服务">
+  <meta name="keywords" content="Telegraph文件床,Workers文件床, Cloudflare, Workers,telegra.ph, 文件床">
+  <title>Telegraph文件床-基于Workers的文件床服务</title>
   <link rel="icon" href="https://p1.meituan.net/csc/c195ee91001e783f39f41ffffbbcbd484286.ico" type="image/x-icon">
   <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
   <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com">
@@ -422,7 +432,7 @@ async function handleRootRequest(request, config) {
 <body>
   <div class="background" id="background"></div>
   <div class="card">
-      <div class="title">Telegraph图床</div>
+      <div class="title">Telegraph文件床</div>
       <button type="button" class="btn" id="viewCacheBtn" title="查看历史记录"><i class="fas fa-clock"></i></button>
       <button type="button" class="btn" id="compressionToggleBtn"><i class="fas fa-compress"></i></button>
       <div class="card-body">
@@ -659,7 +669,7 @@ async function handleRootRequest(request, config) {
               toastr.clear();
             }
             const formData = new FormData();
-            formData.append('file', file, file.name);
+            formData.append('file', file, originalFile.name);
             $('#uploadProgress').show();
             $('#progressText').text('上传中... 0%');
             const xhr = new XMLHttpRequest();
@@ -708,7 +718,7 @@ async function handleRootRequest(request, config) {
                 timeOut: 3000,
                 progressBar: true
               });
-              saveToLocalCache(responseData.data, file.name, fileHash);
+              saveToLocalCache(responseData.data, originalFile.name, fileHash);
             }
           } catch (error) {
             console.error('处理文件时出现错误:', error);
@@ -917,28 +927,46 @@ async function handleAdminRequest(request, config) {
   }
   const url = new URL(request.url);
   const page = parseInt(url.searchParams.get('page') || '1', 10);
+  const folder = url.searchParams.get('folder') || '';
 
-  return await generateAdminPage(config.database, page);
+  return await generateAdminPage(config.database, page, folder);
 }
 
-async function generateAdminPage(DATABASE, page = 1) {
+async function generateAdminPage(DATABASE, page = 1, currentFolder = '') {
   const pageSize = 50;
   const offset = (page - 1) * pageSize;
-  const totalCount = await DATABASE.prepare('SELECT COUNT(*) as count FROM media').first();
+
+  // Ensure tables exist (idempotent)
+  await DATABASE.prepare(`CREATE TABLE IF NOT EXISTS folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+  )`).run();
+  // Ensure folder column exists on media (may already exist)
+  try { await DATABASE.prepare('ALTER TABLE media ADD COLUMN folder TEXT DEFAULT ""').run(); } catch(_) {}
+
+  const totalCount = await DATABASE.prepare(
+    'SELECT COUNT(*) as count FROM media WHERE folder = ?'
+  ).bind(currentFolder).first();
   const totalPages = Math.ceil(totalCount.count / pageSize);
-  const mediaData = await fetchMediaData(DATABASE, pageSize, offset);
-  const mediaHtml = mediaData.map(({ url }) => {
+
+  // Get all folders for sidebar
+  const foldersResult = await DATABASE.prepare('SELECT name FROM folders ORDER BY name ASC').all();
+  const folders = foldersResult.results.map(r => r.name);
+
+  const mediaData = await fetchMediaData(DATABASE, pageSize, offset, currentFolder);
+  const mediaHtml = mediaData.map(({ url, fileName }) => {
     const fileExtension = url.split('.').pop().toLowerCase();
     const timestamp = url.split('/').pop().split('.')[0];
     const mediaType = escapeHtml(fileExtension);
     const escapedUrl = escapeHtml(url);
+    const displayName = escapeHtml(fileName || '未知文件');
     const supportedImageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'svg'];
     const supportedVideoExtensions = ['mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm'];
     const isSupported = [...supportedImageExtensions, ...supportedVideoExtensions].includes(fileExtension);
     const backgroundStyle = isSupported ? '' : `style="font-size: 50px; display: flex; justify-content: center; align-items: center;"`;
     const icon = isSupported ? '' : '📁';
     return `
-    <div class="media-container" data-key="${escapedUrl}" onclick="toggleImageSelection(this)" ${backgroundStyle}>
+    <div class="media-container" data-key="${escapedUrl}" data-filename="${displayName}" onclick="toggleImageSelection(this)" ondblclick="event.stopPropagation(); openRenameModal('${escapedUrl}', this)" ${backgroundStyle}>
       <div class="skeleton"></div>
       <div class="media-type">${mediaType}</div>
       ${supportedVideoExtensions.includes(fileExtension) ? `
@@ -949,11 +977,28 @@ async function generateAdminPage(DATABASE, page = 1) {
       ` : `
         ${isSupported ? `<img class="gallery-image lazy" data-src="${escapedUrl}" alt="Image">` : icon}
       `}
-      <div class="upload-time">上传时间: ${escapeHtml(new Date(parseInt(timestamp)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }))}</div>
+      <div class="file-name-preview" title="${displayName}">${displayName}</div>
+      <div class="file-info">
+        <div class="file-name" title="${displayName}">${displayName}</div>
+        <div class="upload-time">上传时间: ${escapeHtml(new Date(parseInt(timestamp)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }))}</div>
+      </div>
     </div>
     `;
   }).join('');
   
+  // Build folder sidebar HTML
+  const escapedCurrentFolder = escapeHtml(currentFolder);
+  const folderSidebarItems = folders.map(f => {
+    const ef = escapeHtml(f);
+    const isActive = f === currentFolder;
+    return `<div class="folder-item ${isActive ? 'folder-active' : ''}" onclick="navigateFolder('${ef}')">
+      <span class="folder-icon">📁</span>
+      <span class="folder-name" title="${ef}">${ef}</span>
+      <button class="folder-rename-btn" title="重命名文件夹" onclick="event.stopPropagation(); openFolderRenameModal('${ef}')">✎</button>
+      <button class="folder-delete-btn" title="删除文件夹" onclick="event.stopPropagation(); deleteFolder('${ef}')">✕</button>
+    </div>`;
+  }).join('');
+
   const html = `
   <!DOCTYPE html>
   <html>
@@ -1057,12 +1102,12 @@ async function generateAdminPage(DATABASE, page = 1) {
         text-transform: uppercase;
         letter-spacing: 0.5px;
       }
-      .upload-time {
+      .file-info {
         position: absolute;
         bottom: 10px;
         left: 10px;
         right: 10px;
-        background: rgba(255, 255, 255, 0.9);
+        background: rgba(255, 255, 255, 0.95);
         backdrop-filter: blur(4px);
         padding: 8px 10px;
         border-radius: 8px;
@@ -1070,7 +1115,79 @@ async function generateAdminPage(DATABASE, page = 1) {
         font-size: 12px;
         z-index: 10;
         display: none;
+        flex-direction: column;
+        gap: 4px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
       }
+      .file-name {
+        font-weight: 600;
+        color: #333;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        border-bottom: 1px solid rgba(0,0,0,0.05);
+        padding-bottom: 4px;
+      }
+      .upload-time {
+        font-size: 11px;
+        color: #666;
+      }
+      /* File name shown when NOT selected */
+      .file-name-preview {
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        background: rgba(0,0,0,0.45);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 500;
+        padding: 5px 8px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        border-radius: 0 0 14px 14px;
+        z-index: 9;
+        pointer-events: none;
+        transition: opacity 0.2s;
+      }
+      .media-container.selected .file-name-preview { opacity: 0; }
+      /* Rename modal */
+      .rename-modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.4);
+        backdrop-filter: blur(4px);
+        z-index: 10000;
+        justify-content: center;
+        align-items: center;
+      }
+      .rename-modal-overlay.show { display: flex; }
+      .rename-modal-box {
+        background: white;
+        border-radius: 18px;
+        padding: 28px 32px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+        min-width: 320px;
+        max-width: 90vw;
+      }
+      .rename-modal-title { font-size: 18px; font-weight: 700; color: #333; margin-bottom: 16px; }
+      .rename-input {
+        width: 100%;
+        padding: 10px 14px;
+        border: 1.5px solid rgba(102,126,234,0.35);
+        border-radius: 10px;
+        font-size: 14px;
+        color: #333;
+        outline: none;
+        margin-bottom: 18px;
+        box-sizing: border-box;
+        transition: border-color 0.2s;
+      }
+      .rename-input:focus { border-color: #667eea; }
+      .rename-hint { font-size: 12px; color: #999; margin-bottom: 18px; margin-top: -12px; }
+      .rename-actions { display: flex; gap: 10px; justify-content: flex-end; }
       .gallery-image, .gallery-video {
         width: 100%;
         height: 100%;
@@ -1267,31 +1384,190 @@ async function generateAdminPage(DATABASE, page = 1) {
         .pagination .page-info {
           font-size: 14px;
         }
+        .layout-body { flex-direction: column; }
+        .sidebar { width: 100%; border-right: none; border-bottom: 1px solid rgba(102,126,234,0.12); padding-bottom: 10px; margin-bottom: 10px; max-height: 220px; }
+        .main-content { padding: 0; }
       }
+      /* ── Layout ── */
+      .layout-body {
+        display: flex;
+        gap: 0;
+        align-items: flex-start;
+      }
+      /* ── Sidebar ── */
+      .sidebar {
+        width: 220px;
+        min-width: 180px;
+        max-width: 260px;
+        flex-shrink: 0;
+        background: rgba(255,255,255,0.85);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.6);
+        box-shadow: 0 4px 20px rgba(102,126,234,0.10);
+        padding: 16px 12px;
+        margin-right: 18px;
+        position: sticky;
+        top: 10px;
+        max-height: calc(100vh - 40px);
+        overflow-y: auto;
+      }
+      .sidebar-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: #667eea;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 10px;
+        padding-left: 6px;
+      }
+      .folder-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: 13px;
+        color: #444;
+        margin-bottom: 4px;
+        position: relative;
+      }
+      .folder-item:hover { background: rgba(102,126,234,0.1); }
+      .folder-active { background: rgba(102,126,234,0.15); color: #667eea; font-weight: 600; }
+      .folder-icon { font-size: 16px; flex-shrink: 0; }
+      .folder-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .folder-delete-btn,
+      .folder-rename-btn {
+        display: none;
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        padding: 2px 4px;
+        border-radius: 4px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+      .folder-delete-btn { color: #e55; }
+      .folder-rename-btn { color: #667eea; }
+      .folder-item:hover .folder-delete-btn,
+      .folder-item:hover .folder-rename-btn { display: block; }
+      .folder-delete-btn:hover { background: rgba(220,50,50,0.1); }
+      .folder-rename-btn:hover { background: rgba(102,126,234,0.12); }
+      .add-folder-btn {
+        width: 100%;
+        margin-top: 10px;
+        padding: 8px;
+        border-radius: 10px;
+        border: 1.5px dashed rgba(102,126,234,0.4);
+        background: none;
+        color: #667eea;
+        font-size: 13px;
+        cursor: pointer;
+        transition: all 0.2s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+      }
+      .add-folder-btn:hover { border-color: #667eea; background: rgba(102,126,234,0.07); }
+      /* ── Main content ── */
+      .main-content { flex: 1; min-width: 0; }
+      /* ── Breadcrumb ── */
+      .breadcrumb {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 14px;
+        color: #777;
+        margin-bottom: 14px;
+        padding: 8px 14px;
+        background: rgba(255,255,255,0.7);
+        border-radius: 10px;
+        backdrop-filter: blur(6px);
+      }
+      .breadcrumb-link { color: #667eea; cursor: pointer; font-weight: 500; }
+      .breadcrumb-link:hover { text-decoration: underline; }
+      .breadcrumb-sep { color: #bbb; }
+      /* ── Move modal ── */
+      .modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.4);
+        backdrop-filter: blur(4px);
+        z-index: 9999;
+        justify-content: center;
+        align-items: center;
+      }
+      .modal-overlay.show { display: flex; }
+      .modal-box {
+        background: white;
+        border-radius: 18px;
+        padding: 28px 32px;
+        box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+        min-width: 320px;
+        max-width: 90vw;
+      }
+      .modal-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #333;
+        margin-bottom: 18px;
+      }
+      .modal-folder-list { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow-y: auto; margin-bottom: 18px; }
+      .modal-folder-option {
+        padding: 10px 14px;
+        border-radius: 10px;
+        cursor: pointer;
+        border: 1.5px solid rgba(102,126,234,0.2);
+        font-size: 14px;
+        color: #444;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        transition: all 0.2s;
+      }
+      .modal-folder-option:hover, .modal-folder-option.selected-target { background: rgba(102,126,234,0.12); border-color: #667eea; color: #667eea; font-weight: 600; }
+      .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+      .btn-cancel {
+        padding: 10px 20px; border-radius: 10px; border: 1.5px solid #ddd; background: none; color: #555; cursor: pointer; font-size: 14px; transition: all 0.2s;
+      }
+      .btn-cancel:hover { background: #f5f5f5; }
+      .btn-confirm {
+        padding: 10px 20px; border-radius: 10px; border: none;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white; cursor: pointer; font-size: 14px; font-weight: 600;
+        box-shadow: 0 4px 12px rgba(102,126,234,0.3); transition: all 0.2s;
+      }
+      .btn-confirm:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(102,126,234,0.4); }
     </style>
     <script>
     let selectedCount = 0;
     const selectedKeys = new Set();
     let isAllSelected = false;
+    const currentFolder = '${escapedCurrentFolder}';
+    let moveTargetFolder = null;
   
     function toggleImageSelection(container) {
       const key = container.getAttribute('data-key');
       container.classList.toggle('selected');
-      const uploadTime = container.querySelector('.upload-time');
+      const fileInfo = container.querySelector('.file-info');
       if (container.classList.contains('selected')) {
         selectedKeys.add(key);
         selectedCount++;
-        uploadTime.style.display = 'block';
+        fileInfo.style.display = 'flex';
       } else {
         selectedKeys.delete(key);
         selectedCount--;
-        uploadTime.style.display = 'none';
+        fileInfo.style.display = 'none';
       }
       updateDeleteButton();
     }
   
     function updateDeleteButton() {
-      const deleteButton = document.getElementById('delete-button');
       const countDisplay = document.getElementById('selected-count');
       countDisplay.textContent = selectedCount;
       const headerRight = document.querySelector('.header-right');
@@ -1301,7 +1577,202 @@ async function generateAdminPage(DATABASE, page = 1) {
         headerRight.classList.add('hidden');
       }
     }
-  
+
+    function navigateFolder(folder) {
+      const url = new URL(window.location.href);
+      url.searchParams.set('folder', folder);
+      url.searchParams.set('page', '1');
+      window.location.href = url.toString();
+    }
+
+    async function createFolder() {
+      const name = prompt('请输入文件夹名称:');
+      if (!name || !name.trim()) return;
+      const trimmed = name.trim();
+      const response = await fetch('/create-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed })
+      });
+      if (response.ok) {
+        window.location.reload();
+      } else {
+        const data = await response.json().catch(() => ({}));
+        alert(data.error || '创建文件夹失败');
+      }
+    }
+
+    async function deleteFolder(name) {
+      const confirmed = confirm('删除文件夹"' + name + '"后，其中的文件将移至根目录，确定要删除吗？');
+      if (!confirmed) return;
+      const response = await fetch('/delete-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      if (response.ok) {
+        if (currentFolder === name) navigateFolder('');
+        else window.location.reload();
+      } else {
+        alert('删除文件夹失败');
+      }
+    }
+
+    // ── Folder Rename ──
+    let _renameFolderOldName = null;
+
+    function openFolderRenameModal(name) {
+      _renameFolderOldName = name;
+      document.getElementById('folderRenameInput').value = name;
+      document.getElementById('folderRenameModal').classList.add('show');
+      setTimeout(() => document.getElementById('folderRenameInput').focus(), 80);
+    }
+
+    function closeFolderRenameModal() {
+      document.getElementById('folderRenameModal').classList.remove('show');
+      _renameFolderOldName = null;
+    }
+
+    async function confirmFolderRename() {
+      const newName = document.getElementById('folderRenameInput').value.trim();
+      if (!newName) { alert('文件夹名称不能为空'); return; }
+      if (newName === _renameFolderOldName) { closeFolderRenameModal(); return; }
+      const response = await fetch('/rename-folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ oldName: _renameFolderOldName, newName })
+      });
+      if (response.ok) {
+        // If currently viewing the renamed folder, redirect to it with new name
+        if (currentFolder === _renameFolderOldName) {
+          const url = new URL(window.location.href);
+          url.searchParams.set('folder', newName);
+          window.location.href = url.toString();
+        } else {
+          window.location.reload();
+        }
+      } else {
+        const data = await response.json().catch(() => ({}));
+        alert(data.error || '重命名文件夹失败');
+      }
+    }
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && document.getElementById('folderRenameModal').classList.contains('show')) {
+        confirmFolderRename();
+      }
+      if (e.key === 'Escape' && document.getElementById('folderRenameModal').classList.contains('show')) {
+        closeFolderRenameModal();
+      }
+    });
+
+    function showMoveModal() {
+      if (selectedKeys.size === 0) return;
+      moveTargetFolder = null;
+      document.querySelectorAll('.modal-folder-option').forEach(el => el.classList.remove('selected-target'));
+      document.getElementById('moveModal').classList.add('show');
+    }
+
+    function hideMoveModal() {
+      document.getElementById('moveModal').classList.remove('show');
+      moveTargetFolder = null;
+    }
+
+    function selectMoveTarget(folder, el) {
+      moveTargetFolder = folder;
+      document.querySelectorAll('.modal-folder-option').forEach(e => e.classList.remove('selected-target'));
+      el.classList.add('selected-target');
+    }
+
+    async function confirmMove() {
+      if (moveTargetFolder === null) { alert('请选择目标文件夹'); return; }
+      const urls = Array.from(selectedKeys);
+      const response = await fetch('/move-files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls, targetFolder: moveTargetFolder })
+      });
+      if (response.ok) {
+        hideMoveModal();
+        // Remove moved items from current view
+        urls.forEach(url => {
+          const el = document.querySelector('.media-container[data-key="' + CSS.escape(url) + '"]');
+          if (el) {
+            el.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+            el.style.opacity = '0';
+            el.style.transform = 'scale(0.8)';
+            setTimeout(() => el.remove(), 300);
+          }
+        });
+        selectedKeys.clear();
+        selectedCount = 0;
+        isAllSelected = false;
+        updateDeleteButton();
+        setTimeout(() => {
+          const totalEl = document.querySelector('.header-left span:first-child');
+          if (totalEl) {
+            const cur = parseInt(totalEl.textContent.match(/\\d+/)[0]);
+            totalEl.textContent = '媒体文件 ' + Math.max(0, cur - urls.length) + ' 个';
+          }
+        }, 350);
+      } else {
+        alert('移动失败');
+      }
+    }
+
+    // ── Rename ──
+    let _renameUrl = null;
+    let _renameContainer = null;
+
+    function openRenameModal(url, container) {
+      _renameUrl = url;
+      _renameContainer = container;
+      const current = container.dataset.filename || '';
+      document.getElementById('renameInput').value = current;
+      document.getElementById('renameModal').classList.add('show');
+      setTimeout(() => document.getElementById('renameInput').focus(), 80);
+    }
+
+    function closeRenameModal() {
+      document.getElementById('renameModal').classList.remove('show');
+      _renameUrl = null;
+      _renameContainer = null;
+    }
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' && document.getElementById('renameModal').classList.contains('show')) {
+        confirmRename();
+      }
+      if (e.key === 'Escape' && document.getElementById('renameModal').classList.contains('show')) {
+        closeRenameModal();
+      }
+    });
+
+    async function confirmRename() {
+      const newName = document.getElementById('renameInput').value.trim();
+      if (!newName) { alert('文件名不能为空'); return; }
+      const response = await fetch('/rename-file', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: _renameUrl, newName })
+      });
+      if (response.ok) {
+        // Update UI in-place
+        if (_renameContainer) {
+          const escaped = newName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+          const preview = _renameContainer.querySelector('.file-name-preview');
+          const infoName = _renameContainer.querySelector('.file-name');
+          if (preview) { preview.textContent = newName; preview.title = newName; }
+          if (infoName) { infoName.textContent = newName; infoName.title = newName; }
+          _renameContainer.dataset.filename = newName;
+        }
+        closeRenameModal();
+      } else {
+        const data = await response.json().catch(() => ({}));
+        alert(data.error || '重命名失败');
+      }
+    }
+
     async function deleteSelectedImages() {
       if (selectedKeys.size === 0) return;
       const confirmation = confirm('你确定要删除选中的媒体文件吗？此操作无法撤回。');
@@ -1317,7 +1788,6 @@ async function generateAdminPage(DATABASE, page = 1) {
       });
 
       if (response.ok) {
-        // 局部更新 DOM，添加淡出动画
         const containers = document.querySelectorAll('.media-container');
         const containersToRemove = [];
 
@@ -1331,17 +1801,14 @@ async function generateAdminPage(DATABASE, page = 1) {
           }
         });
 
-        // 等待动画完成后移除元素
         setTimeout(() => {
           containersToRemove.forEach(container => container.remove());
 
-          // 更新媒体文件总数
           const totalCountElement = document.querySelector('.header-left span:first-child');
           const currentTotal = parseInt(totalCountElement.textContent.match(/\\d+/)[0]);
           const newTotal = currentTotal - keysToDelete.length;
           totalCountElement.textContent = '媒体文件 ' + newTotal + ' 个';
 
-          // 更新分页信息
           const pageInfo = document.querySelector('.page-info');
           if (pageInfo) {
             const match = pageInfo.textContent.match(/共 (\\d+) 个/);
@@ -1350,7 +1817,6 @@ async function generateAdminPage(DATABASE, page = 1) {
             }
           }
 
-          // 重置选择状态
           selectedKeys.clear();
           selectedCount = 0;
           isAllSelected = false;
@@ -1414,13 +1880,13 @@ async function generateAdminPage(DATABASE, page = 1) {
             container.classList.remove('selected');
             const key = container.getAttribute('data-key');
             selectedKeys.delete(key);
-            container.querySelector('.upload-time').style.display = 'none';
+            container.querySelector('.file-info').style.display = 'none';
           } else {
             if (!container.classList.contains('selected')) {
               container.classList.add('selected');
               const key = container.getAttribute('data-key');
               selectedKeys.add(key);
-              container.querySelector('.upload-time').style.display = 'block';
+              container.querySelector('.file-info').style.display = 'flex';
             }
           }
         }
@@ -1509,23 +1975,88 @@ async function generateAdminPage(DATABASE, page = 1) {
             <button onclick="copyFormattedLinks('markdown')">Markdown</button>
           </div>
         </div>
+        <button class="delete-button" onclick="showMoveModal()">移动到</button>
         <button id="select-all-button" class="delete-button" onclick="selectAllImages()">全选</button>
         <button id="delete-button" class="delete-button" onclick="deleteSelectedImages()">删除</button>
       </div>
     </div>
-    <div class="gallery">
-      ${mediaData.length === 0 ? '<div class="empty-state"><i>📁</i><div>暂无媒体文件</div></div>' : mediaHtml}
+    <div class="layout-body">
+      <!-- Sidebar -->
+      <div class="sidebar">
+        <div class="sidebar-title">📂 文件夹</div>
+        <div class="folder-item ${currentFolder === '' ? 'folder-active' : ''}" onclick="navigateFolder('')">
+          <span class="folder-icon">🏠</span>
+          <span class="folder-name">全部文件</span>
+        </div>
+        ${folderSidebarItems}
+        <button class="add-folder-btn" onclick="createFolder()">＋ 新建文件夹</button>
+      </div>
+      <!-- Main Content -->
+      <div class="main-content">
+        ${currentFolder ? `<div class="breadcrumb">
+          <span class="breadcrumb-link" onclick="navigateFolder('')">🏠 全部文件</span>
+          <span class="breadcrumb-sep">›</span>
+          <span>📁 ${escapedCurrentFolder}</span>
+        </div>` : ''}
+        <div class="gallery">
+          ${mediaData.length === 0 ? '<div class="empty-state"><i>📁</i><div>暂无媒体文件</div></div>' : mediaHtml}
+        </div>
+        ${mediaData.length > 0 ? `
+        <div class="pagination">
+          <button onclick="goToPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+          <span class="page-info">第 ${page} / ${totalPages} 页 (共 ${totalCount.count} 个)</span>
+          <button onclick="goToPage(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+        </div>
+        ` : ''}
+        <div class="footer">到底啦</div>
+      </div>
     </div>
-    ${mediaData.length > 0 ? `
-    <div class="pagination">
-      <button onclick="goToPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
-      <span class="page-info">第 ${page} / ${totalPages} 页 (共 ${totalCount.count} 个)</span>
-      <button onclick="goToPage(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+
+    <!-- Move Modal -->
+    <div class="modal-overlay" id="moveModal" onclick="if(event.target===this)hideMoveModal()">
+      <div class="modal-box">
+        <div class="modal-title">移动到文件夹</div>
+        <div class="modal-folder-list">
+          <div class="modal-folder-option" onclick="selectMoveTarget('', this)">
+            <span>🏠</span> 根目录（全部文件）
+          </div>
+          ${folders.map(f => `<div class="modal-folder-option" onclick="selectMoveTarget('${escapeHtml(f)}', this)">
+            <span>📁</span> ${escapeHtml(f)}
+          </div>`).join('')}
+        </div>
+        <div class="modal-actions">
+          <button class="btn-cancel" onclick="hideMoveModal()">取消</button>
+          <button class="btn-confirm" onclick="confirmMove()">确认移动</button>
+        </div>
+      </div>
     </div>
-    ` : ''}
-    <div class="footer">
-      到底啦
+
+    <!-- Rename Modal -->
+    <div class="rename-modal-overlay" id="renameModal" onclick="if(event.target===this)closeRenameModal()">
+      <div class="rename-modal-box">
+        <div class="rename-modal-title">✏️ 修改文件名</div>
+        <input class="rename-input" id="renameInput" type="text" placeholder="请输入新文件名" />
+        <div class="rename-hint">提示：修改文件名不会影响分享链接</div>
+        <div class="rename-actions">
+          <button class="btn-cancel" onclick="closeRenameModal()">取消</button>
+          <button class="btn-confirm" onclick="confirmRename()">确认</button>
+        </div>
+      </div>
     </div>
+
+    <!-- Folder Rename Modal -->
+    <div class="rename-modal-overlay" id="folderRenameModal" onclick="if(event.target===this)closeFolderRenameModal()">
+      <div class="rename-modal-box">
+        <div class="rename-modal-title">✏️ 重命名文件夹</div>
+        <input class="rename-input" id="folderRenameInput" type="text" placeholder="请输入新文件夹名称" />
+        <div class="rename-hint">提示：重命名文件夹不会影响文件夹内文件的分享链接</div>
+        <div class="rename-actions">
+          <button class="btn-cancel" onclick="closeFolderRenameModal()">取消</button>
+          <button class="btn-confirm" onclick="confirmFolderRename()">确认</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       function goToPage(pageNum) {
         const url = new URL(window.location.href);
@@ -1539,13 +2070,14 @@ async function generateAdminPage(DATABASE, page = 1) {
   return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-async function fetchMediaData(DATABASE, limit = null, offset = 0) {
-  let query = 'SELECT url, fileId FROM media ORDER BY url DESC';
+async function fetchMediaData(DATABASE, limit = null, offset = 0, folder = '') {
+  let query = 'SELECT url, fileId, fileName FROM media WHERE folder = ? ORDER BY url DESC';
+  const bindings = [folder];
   if (limit !== null) {
     query += ` LIMIT ${limit} OFFSET ${offset}`;
   }
-  const result = await DATABASE.prepare(query).all();
-  return result.results.map(row => ({ fileId: row.fileId, url: row.url }));
+  const result = await DATABASE.prepare(query).bind(...bindings).all();
+  return result.results.map(row => ({ fileId: row.fileId, url: row.url, fileName: row.fileName }));
 }
 
 async function handleUploadRequest(request, config) {
@@ -1559,6 +2091,10 @@ async function handleUploadRequest(request, config) {
     if (config.enableAuth && !authenticate(request, config.username, config.password)) {
       return unauthorizedResponse();
     }
+    
+    // 记录原始文件名，用于存入数据库
+    const originalFileName = file.name;
+    
     const uploadFormData = new FormData();
     uploadFormData.append("chat_id", config.tgChatId);
     if (file.type.startsWith('image/gif')) {
@@ -1585,9 +2121,12 @@ async function handleUploadRequest(request, config) {
     const timestamp = Date.now();
     const isImage = CONTENT_TYPE_MAP[fileExtension]?.startsWith('image/');
     const imageURL = `https://${config.domain}/${timestamp}.${fileExtension}`;
+    
+    // 将 URL, fileId 以及新增的 fileName 一起写入数据库
     await config.database.prepare(
-      'INSERT INTO media (url, fileId) VALUES (?, ?) ON CONFLICT(url) DO NOTHING'
-    ).bind(imageURL, fileId).run();
+      'INSERT INTO media (url, fileId, fileName) VALUES (?, ?, ?) ON CONFLICT(url) DO NOTHING'
+    ).bind(imageURL, fileId, originalFileName).run();
+    
     return jsonResponse({ data: imageURL });
   } catch (error) {
     console.error('内部服务器错误:', error);
@@ -1707,5 +2246,108 @@ async function handleDeleteImagesRequest(request, config) {
     return jsonResponse({ message: '删除成功' });
   } catch (error) {
     return jsonResponse({ error: '删除失败', details: error.message }, 500);
+  }
+}
+
+async function handleCreateFolderRequest(request, config) {
+  if (!authenticate(request, config.username, config.password)) return unauthorizedResponse();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const { name } = await request.json();
+    if (!name || !name.trim()) return jsonResponse({ error: '文件夹名称不能为空' }, 400);
+    const trimmed = name.trim();
+    if (trimmed.length > 64) return jsonResponse({ error: '文件夹名称过长' }, 400);
+    await config.database.prepare(
+      'INSERT INTO folders (name) VALUES (?) ON CONFLICT(name) DO NOTHING'
+    ).bind(trimmed).run();
+    return jsonResponse({ message: '创建成功', name: trimmed });
+  } catch (error) {
+    return jsonResponse({ error: '创建失败', details: error.message }, 500);
+  }
+}
+
+async function handleDeleteFolderRequest(request, config) {
+  if (!authenticate(request, config.username, config.password)) return unauthorizedResponse();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const { name } = await request.json();
+    if (!name) return jsonResponse({ error: '文件夹名称不能为空' }, 400);
+    // Move all files in this folder to root
+    await config.database.prepare(
+      'UPDATE media SET folder = "" WHERE folder = ?'
+    ).bind(name).run();
+    // Delete folder record
+    await config.database.prepare(
+      'DELETE FROM folders WHERE name = ?'
+    ).bind(name).run();
+    return jsonResponse({ message: '删除成功' });
+  } catch (error) {
+    return jsonResponse({ error: '删除失败', details: error.message }, 500);
+  }
+}
+
+async function handleMoveFilesRequest(request, config) {
+  if (!authenticate(request, config.username, config.password)) return unauthorizedResponse();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const { urls, targetFolder } = await request.json();
+    if (!Array.isArray(urls) || urls.length === 0) return jsonResponse({ error: '没有要移动的文件' }, 400);
+    if (targetFolder === undefined || targetFolder === null) return jsonResponse({ error: '目标文件夹不能为空' }, 400);
+    const placeholders = urls.map(() => '?').join(',');
+    await config.database.prepare(
+      `UPDATE media SET folder = ? WHERE url IN (${placeholders})`
+    ).bind(targetFolder, ...urls).run();
+    return jsonResponse({ message: '移动成功' });
+  } catch (error) {
+    return jsonResponse({ error: '移动失败', details: error.message }, 500);
+  }
+}
+
+async function handleRenameFileRequest(request, config) {
+  if (!authenticate(request, config.username, config.password)) return unauthorizedResponse();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const { url, newName } = await request.json();
+    if (!url) return jsonResponse({ error: '文件URL不能为空' }, 400);
+    if (!newName || !newName.trim()) return jsonResponse({ error: '文件名不能为空' }, 400);
+    const trimmed = newName.trim();
+    if (trimmed.length > 255) return jsonResponse({ error: '文件名过长' }, 400);
+    const result = await config.database.prepare(
+      'UPDATE media SET fileName = ? WHERE url = ?'
+    ).bind(trimmed, url).run();
+    if (result.changes === 0) return jsonResponse({ error: '未找到对应文件' }, 404);
+    return jsonResponse({ message: '重命名成功', fileName: trimmed });
+  } catch (error) {
+    return jsonResponse({ error: '重命名失败', details: error.message }, 500);
+  }
+}
+
+async function handleRenameFolderRequest(request, config) {
+  if (!authenticate(request, config.username, config.password)) return unauthorizedResponse();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const { oldName, newName } = await request.json();
+    if (!oldName) return jsonResponse({ error: '原文件夹名称不能为空' }, 400);
+    if (!newName || !newName.trim()) return jsonResponse({ error: '新文件夹名称不能为空' }, 400);
+    const trimmed = newName.trim();
+    if (trimmed.length > 64) return jsonResponse({ error: '文件夹名称过长' }, 400);
+    if (trimmed === oldName) return jsonResponse({ message: '名称未变更' });
+    // Check if target name already exists
+    const existing = await config.database.prepare(
+      'SELECT id FROM folders WHERE name = ?'
+    ).bind(trimmed).first();
+    if (existing) return jsonResponse({ error: '该文件夹名称已存在' }, 409);
+    // Rename folder record
+    const result = await config.database.prepare(
+      'UPDATE folders SET name = ? WHERE name = ?'
+    ).bind(trimmed, oldName).run();
+    if (result.changes === 0) return jsonResponse({ error: '未找到对应文件夹' }, 404);
+    // Update all files in this folder — this preserves their file IDs and share URLs
+    await config.database.prepare(
+      'UPDATE media SET folder = ? WHERE folder = ?'
+    ).bind(trimmed, oldName).run();
+    return jsonResponse({ message: '重命名成功', newName: trimmed });
+  } catch (error) {
+    return jsonResponse({ error: '重命名失败', details: error.message }, 500);
   }
 }
