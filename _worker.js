@@ -1960,7 +1960,7 @@ async function generateAdminPage(DATABASE, page = 1, currentFolder = '') {
   </script>
   </head>
   <body>
-    <h1 class="page-title">图库管理</h1>
+    <h1 class="page-title">文件管理</h1>
     <div class="header">
       <div class="header-left">
         <span>媒体文件 ${totalCount.count} 个</span>
